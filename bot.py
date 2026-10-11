@@ -10,9 +10,10 @@ SCAM_SIGNATURE = "tr.ee/dev-to"
 TIGER_REPLY = "THIS IS A PHISHING SCAM 🚨 Do not click this link. Dev.to will never ask you to verify your account via a third-party link in the comments."
 
 def main():
-    print("🐯 Tiger Sentinel: Scanning Dev.to for threats...")
+    print("🐯 Tiger Sentinel: Scanning Dev.to LATEST articles for threats...")
     
-    response = requests.get("https://dev.to/api/articles?top=3", headers=HEADERS)
+    # Fetch the 30 most recent articles (Latest feed) to catch spam hiding in new/small posts
+    response = requests.get("https://dev.to/api/articles?per_page=30", headers=HEADERS)
     if response.status_code != 200:
         print("❌ Failed to fetch articles.")
         return
@@ -29,12 +30,13 @@ def main():
         
         for comment in comments:
             if SCAM_SIGNATURE in comment['body_html']:
+                # Check if the bot already replied to this article to avoid spamming
                 bot_replies = [c for c in comments if c.get('user', {}).get('username') == 'watch_dog']
                 if len(bot_replies) > 0:
                     print(f"✅ Already neutralized scam on article {article_id}. Skipping.")
                     continue
 
-                print(f" SCAM DETECTED on article {article_id}! Deploying counter-measure...")
+                print(f"🚨 SCAM DETECTED on article {article_id}! Deploying counter-measure...")
                 
                 payload = {
                     "comment": {
@@ -51,6 +53,7 @@ def main():
                 else:
                     print(f"❌ Failed to post. Status: {post_resp.status_code}")
                 
+                # Human-like delay to respect API rate limits
                 time.sleep(random.randint(3, 7))
 
 if __name__ == "__main__":
