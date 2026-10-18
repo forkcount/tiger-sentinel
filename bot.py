@@ -2,7 +2,7 @@
 """
 Tiger Sentinel v6 — full dev.to scan.
 Scans ALL articles on dev.to (paginated until API returns empty).
-Logs what it found and what it scanned, page by page.
+Reads comments only. Logs what it found and what it scanned, page by page.
 Runs in GitHub Actions. Designed for a 6-hour job timeout.
 """
 
