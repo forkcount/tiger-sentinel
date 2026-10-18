@@ -1,305 +1,258 @@
+#!/usr/bin/env python3
+"""
+Tiger Sentinel v6 — full dev.to scan.
+Scans ALL articles on dev.to (paginated until API returns empty).
+Logs what it found and what it scanned, page by page.
+Runs in GitHub Actions. Designed for a 6-hour job timeout.
+"""
+
 import json
 import os
 import re
+import sys
 import time
-import requests
+from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
-PAGES_TO_SCAN = 5
-PER_PAGE = 100
-DELAY_BETWEEN_REQUESTS = 3
-PAUSE_EVERY_N_ARTICLES = 10
-PAUSE_DURATION = 60
-SLEEP_WHEN_CAUGHT_UP = 600
-STATE_FILE = 'sentinel-state.json'
-FINDINGS_FILE = 'tiger-sentinel-findings.json'
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+STATE_FILE = "sentinel_state.json"
+OUT_REPORT = "findings_report.json"
+OUT_REVIEW = "findings_review.json"
+DELAY_BETWEEN_ARTICLES = 3.5
+DELAY_BETWEEN_PAGES = 2.0
+MAX_RUNTIME_SECONDS = 5 * 60 * 60
+USER_AGENT = "TigerSentinel/6.0 (dev.to community moderation; full-scan)"
 
-SUSPICIOUS_DOMAINS = [
-    'labgent.tech', 'labagent.tech', 'bit.ly', 'tr.ee', 't.co',
-    'tinyurl.com', 'shorturl.at', 'cutt.ly', 'offerup-pay.top', 'clck.su'
+START = time.time()
+
+PHISHING_DOMAINS = {"labagent.tech", "labagent.io", "suppdev.io", "suppdev.tech"}
+SHORTLINK_DOMAINS = {
+    "bit.ly", "tr.ee", "t.co", "tinyurl.com", "shorturl.at",
+    "cutt.ly", "clck.su", "rb.gy", "goo.gl", "ow.ly", "is.gd",
+}
+IMPERSONATION_PHRASES = [
+    "official platform update", "verify your account", "security protocols",
+    "you have 24 hours", "you have 14 hours", "finish this confirmation",
+    "click here to secure", "claim your reward", "account suspended",
+    "confirm your identity", "urgent action required", "final warning",
 ]
-SUSPICIOUS_PHRASES = [
-    'security update', 'verify your account', 'claim your reward',
-    'click here to secure', 'finish this confirmation', 'dev support',
-    'enter fullscreen mode', 'you have 14 hours', 'official platform update',
-    'security protocols'
-]
-VIETNAMESE_REGEX = re.compile(
-    r'[ăâđêôơưàảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíịòỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵ]',
-    re.IGNORECASE
+BOILERPLATE = ["enter fullscreen mode", "exit fullscreen mode", "link at the end"]
+
+VN_REGEX = re.compile(
+    r"[ăâđêôơưàảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíịòỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵ]",
+    re.IGNORECASE,
 )
-NEW_ACCOUNT_DAYS = 7
+BOT_USERNAME = re.compile(r"^[a-z]+_[a-z]+_[0-9a-f]{8,}$|^[a-z]{4,}[0-9]{5,}$|^[a-z]+_[0-9]{8,}$")
 
-headers = {"Content-Type": "application/json", "User-Agent": "TigerSentinel/3.0"}
-findings = []
-account_profiles = {}
+REPORT = []
+REVIEW = []
+DOMAIN_ACCOUNTS = {}
+SCANNED_PAGES = 0
+SCANNED_ARTICLES = 0
+
+
+def log(msg):
+    elapsed = int(time.time() - START)
+    print(f"[{elapsed}s] {msg}", flush=True)
+
+
+def time_up():
+    return (time.time() - START) > MAX_RUNTIME_SECONDS
 
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"scanned_article_ids": []}
-    try:
-        with open(STATE_FILE, 'r') as f:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
             return json.load(f)
-    except Exception:
-        return {"scanned_article_ids": []}
+    return {"last_article_id": None, "scanned_count": 0}
 
 
 def save_state(state):
-    with open(STATE_FILE, 'w') as f:
+    state["last_run"] = datetime.now(timezone.utc).isoformat()
+    with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
-def save_findings():
-    if not findings:
-        print("No findings to save.")
-        return
-    all_findings = []
-    if os.path.exists(FINDINGS_FILE):
-        try:
-            with open(FINDINGS_FILE, 'r') as f:
-                all_findings = json.load(f)
-        except Exception:
-            all_findings = []
-    all_findings.extend(findings)
-    with open(FINDINGS_FILE, 'w') as f:
-        json.dump(all_findings, f, indent=2)
-    print(f"Saved {len(findings)} new findings. Total: {len(all_findings)}")
-
-
-def days_since(date_str):
-    if not date_str:
-        return 9999
-    from datetime import datetime, timezone
-    try:
-        dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        return (datetime.now(timezone.utc) - dt).days
-    except Exception:
-        return 9999
-
-
-def extract_links(text):
-    return re.findall(r'(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}[^\s]*', text, re.IGNORECASE)
-
-
-def analyze_comment(comment, article, username):
-    raw_html = comment.get('body_html', '') or ''
-    text = re.sub(r'<[^>]+>', '', raw_html)
-    reasons = []
-    if VIETNAMESE_REGEX.search(text):
-        reasons.append('vietnamese-text')
-    links = extract_links(text)
-    for link in links:
-        for d in SUSPICIOUS_DOMAINS:
-            if d in link.lower():
-                reasons.append(f'domain:{d}')
-    for p in SUSPICIOUS_PHRASES:
-        if p in text.lower():
-            reasons.append(f'phrase:{p}')
-    account_age = days_since(comment.get('user', {}).get('joined_at'))
-    if account_age < NEW_ACCOUNT_DAYS:
-        reasons.append(f'new-account:{account_age}d')
-    trimmed = text.strip()
-    if links and trimmed.endswith(links[-1]):
-        reasons.append('link-at-end')
-    for link in links:
-        if re.search(r'tr\.ee|bit\.ly|tinyurl|t\.co|cutt\.ly|clck\.su', link, re.IGNORECASE):
-            reasons.append('shortlink')
-    if re.search(r'within|deadline|hours|minutes|expire|urgent', text, re.IGNORECASE):
-        reasons.append('urgency-phrase')
-    if re.search(r'dev\s*(support|team|to\s*support)|sincerely.*dev', text, re.IGNORECASE):
-        reasons.append('impersonation')
-    if re.search(r'verify.*account|confirm.*account|confirm.*identity|link is in the profile', text, re.IGNORECASE):
-        reasons.append('fake-verification')
-    if re.search(r'enter fullscreen mode|exit fullscreen mode', text, re.IGNORECASE):
-        reasons.append('html-artifact')
-    if len(text) > 500 and links:
-        reasons.append('long-with-link')
-    if VIETNAMESE_REGEX.search(text) and re.search(r'you need|verify|click here', text, re.IGNORECASE):
-        reasons.append('mixed-language')
-    if len(text.strip()) < 15:
-        reasons.append('near-empty')
-    if username not in account_profiles:
-        account_profiles[username] = {'comments': [], 'suspicious_count': 0}
-    account_profiles[username]['comments'].append({
-        'text': text[:200], 'article_id': article['id'],
-        'article_title': article['title'], 'comment_id': comment.get('id_code'),
-        'created_at': comment.get('created_at'), 'reasons': reasons
-    })
-    return reasons
-
-
-def score_account(username):
-    profile = account_profiles.get(username)
-    if not profile or not profile['comments']:
-        return {'score': 0, 'tags': []}
-    all_reasons = []
-    for c in profile['comments']:
-        all_reasons.extend(c['reasons'])
-    unique_reasons = list({r.split(':')[0] for r in all_reasons})
-    tags = []
-    if sum(1 for c in profile['comments'] if len(c['reasons']) >= 2) >= 2:
-        tags.append('serial-offender')
-    domain_counts = {}
-    for c in profile['comments']:
-        for r in c['reasons']:
-            if r.startswith('domain:'):
-                domain_counts[r] = domain_counts.get(r, 0) + 1
-    for dom, count in domain_counts.items():
-        if count >= 2:
-            tags.append(f"repeated-domain:{dom.replace('domain:', '')}")
-    times = []
-    for c in profile['comments']:
-        if c['created_at']:
-            try:
-                from datetime import datetime
-                times.append(datetime.fromisoformat(c['created_at'].replace('Z', '+00:00')).timestamp())
-            except Exception:
-                pass
-    times.sort()
-    for i in range(1, len(times)):
-        if times[i] - times[i - 1] < 3600:
-            tags.append('burst-posting')
-            break
-    if len(profile['comments']) >= 3:
-        first = ','.join(profile['comments'][0]['reasons'])
-        if all(','.join(c['reasons']) == first for c in profile['comments']) and profile['comments'][0]['reasons']:
-            tags.append('identical-signature')
-    if 'vietnamese-text' in unique_reasons and len(unique_reasons) >= 2:
-        tags.append('vn-plus-signal')
-    if len(profile['comments']) >= 2:
-        tags.append('multiple-articles')
-    return {
-        'score': sum(1 for c in profile['comments'] if len(c['reasons']) >= 2),
-        'tags': list(set(tags))
-    }
-
-
 def fetch_json(url):
-    r = requests.get(url, headers=headers, timeout=30)
-    if r.status_code == 429:
-        print("  RATE LIMITED. Waiting 90s...")
-        time.sleep(90)
-        raise Exception('rate limited')
-    if r.status_code != 200:
-        raise Exception(f'{r.status_code} on {url}')
-    return r.json()
-
-
-def fetch_all_articles():
-    all_articles = []
-    for page in range(1, PAGES_TO_SCAN + 1):
-        print(f"  Fetching article list, page {page}/{PAGES_TO_SCAN}...")
-        try:
-            batch = fetch_json(f"https://dev.to/api/articles?per_page={PER_PAGE}&page={page}")
-        except Exception as e:
-            print(f"  Page {page} failed: {e}")
-            break
-        if not batch:
-            print(f"  Page {page} is empty. End of feed.")
-            break
-        all_articles.extend(batch)
-        time.sleep(2)
-    return all_articles
-
-
-def scan_article(article):
-    print(f"Scanning: {article['title'][:50]}...")
+    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
-        comments = fetch_json(f"https://dev.to/api/comments?a_id={article['id']}")
+        with urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except HTTPError as e:
+        if e.code == 429:
+            log("429 rate limited — sleeping 60s")
+            time.sleep(60)
+            return None
+        log(f"HTTP {e.code} on {url}")
+        return None
     except Exception as e:
-        print(f"  skipped ({e})")
+        log(f"Fetch error: {e}")
+        return None
+
+
+def strip_html(s):
+    return re.sub(r"<[^>]+>", "", s or "").strip()
+
+
+def score_comment(text, username):
+    lower = text.lower()
+    strong, weak = [], []
+
+    for d in PHISHING_DOMAINS:
+        if d in lower:
+            strong.append(f"phishing-domain:{d}")
+
+    imp_hits = [p for p in IMPERSONATION_PHRASES if p in lower]
+    if len(imp_hits) >= 2:
+        strong.append(f"impersonation-pair:{'|'.join(imp_hits)}")
+    elif len(imp_hits) == 1:
+        weak.append(f"imp-phrase:{imp_hits[0]}")
+
+    short_hit = next((d for d in SHORTLINK_DOMAINS if d in lower), None)
+    if short_hit:
+        if VN_REGEX.search(text):
+            strong.append(f"shortlink+vn:{short_hit}")
+        elif len(text) < 20:
+            strong.append(f"shortlink+near-empty:{short_hit}")
+        elif BOT_USERNAME.match(username):
+            strong.append(f"shortlink+bot-username:{short_hit}")
+        else:
+            weak.append(f"shortlink:{short_hit}")
+        DOMAIN_ACCOUNTS.setdefault(short_hit, set()).add(username)
+
+    if VN_REGEX.search(text) and not any(s.startswith("shortlink") for s in strong):
+        weak.append("vietnamese-text")
+    for p in BOILERPLATE:
+        if p in lower:
+            weak.append(f"boilerplate:{p}")
+
+    if len(strong) >= 2:
+        return "report", strong + weak
+    if strong or weak:
+        return "review", strong + weak
+    return None, []
+
+
+def scan_article(article, seen_comments):
+    url = f"https://dev.to/api/comments?a_id={article['id']}"
+    comments = fetch_json(url)
+    if not comments:
         return
-    print(f"  {len(comments)} comments")
     for c in comments:
-        username = c.get('user', {}).get('username', 'unknown')
-        reasons = analyze_comment(c, article, username)
-        if len(reasons) >= 2:
-            findings.append({
-                'username': username,
-                'joined': c.get('user', {}).get('joined_at', 'unknown'),
-                'account_age_days': days_since(c.get('user', {}).get('joined_at')),
-                'article_title': article['title'],
-                'article_url': f"https://dev.to{article['path']}",
-                'comment_url': f"https://dev.to{article['path']}#comment-{c.get('id_code')}",
-                'reasons': reasons,
-                'snippet': re.sub(r'<[^>]+>', '', c.get('body_html', ''))[:300]
+        if time_up():
+            return
+        cid = c.get("id_code")
+        if not cid or cid in seen_comments:
+            continue
+        seen_comments.add(cid)
+        text = strip_html(c.get("body_html", ""))
+        username = (c.get("user") or {}).get("username", "unknown")
+        tier, reasons = score_comment(text, username)
+        if not tier:
+            continue
+        record = {
+            "username": username,
+            "comment_url": f"https://dev.to{article['path']}#comment-{cid}",
+            "article_title": article["title"],
+            "reasons": reasons,
+            "content": text[:500],
+        }
+        if tier == "report":
+            REPORT.append(record)
+            log(f"  !!! REPORT: @{username} — {', '.join(reasons)}")
+            log(f"      Content: {text[:200]}")
+        else:
+            REVIEW.append(record)
+
+
+def write_outputs():
+    clusters = []
+    for domain, accounts in DOMAIN_ACCOUNTS.items():
+        if len(accounts) >= 3:
+            clusters.append({
+                "domain": domain,
+                "account_count": len(accounts),
+                "accounts": sorted(accounts),
             })
-            print(f"  !!! FOUND: @{username} — {', '.join(reasons)}")
+    clusters.sort(key=lambda c: -c["account_count"])
+
+    with open(OUT_REPORT, "w") as f:
+        json.dump({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "pages_scanned": SCANNED_PAGES,
+            "articles_scanned": SCANNED_ARTICLES,
+            "reportable_count": len(REPORT),
+            "unique_accounts": len(set(r["username"] for r in REPORT)),
+            "clusters": clusters,
+            "findings": REPORT,
+        }, f, indent=2)
+
+    with open(OUT_REVIEW, "w") as f:
+        json.dump({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "review_count": len(REVIEW),
+            "findings": REVIEW,
+        }, f, indent=2)
+
+    log(f"\n=== DONE ===")
+    log(f"Pages scanned: {SCANNED_PAGES}")
+    log(f"Articles scanned: {SCANNED_ARTICLES}")
+    log(f"Reportable findings: {len(REPORT)}")
+    log(f"Review findings: {len(REVIEW)}")
+    log(f"Clusters (3+ accounts): {len(clusters)}")
+    for c in clusters[:5]:
+        log(f"  {c['domain']}: {c['account_count']} accounts")
 
 
 def main():
-    print("Tiger Sentinel v3 — paginated scan")
-    print(f"Scanning pages 1-{PAGES_TO_SCAN} of dev.to (up to {PAGES_TO_SCAN * PER_PAGE} articles)\n")
+    global SCANNED_PAGES, SCANNED_ARTICLES
+    log("Tiger Sentinel v6 — full dev.to scan")
     state = load_state()
-    seen = set(state.get('scanned_article_ids', []))
-    print(f"Loaded state: {len(seen)} articles already scanned.\n")
-    while True:
-        print("Fetching article list...")
-        try:
-            all_articles = fetch_all_articles()
-        except Exception as e:
-            print(f"  Failed to fetch: {e}. Sleeping 10 min...")
-            time.sleep(SLEEP_WHEN_CAUGHT_UP)
-            continue
-        print(f"Got {len(all_articles)} articles from {PAGES_TO_SCAN} pages.\n")
-        unseen = [a for a in all_articles if a['id'] not in seen]
-        print(f"{len(unseen)} of those are unseen. Scanning...\n")
-        if not unseen:
-            print(f"All articles already scanned. Sleeping {SLEEP_WHEN_CAUGHT_UP // 60} min...\n")
-            time.sleep(SLEEP_WHEN_CAUGHT_UP)
-            continue
-        since_last_pause = 0
-        for a in unseen:
-            scan_article(a)
-            seen.add(a['id'])
-            state['scanned_article_ids'].append(a['id'])
-            save_state(state)
-            since_last_pause += 1
-            if since_last_pause >= PAUSE_EVERY_N_ARTICLES:
-                print(f"\n--- Pausing {PAUSE_DURATION}s (total: {len(state['scanned_article_ids'])}) ---\n")
-                time.sleep(PAUSE_DURATION)
-                since_last_pause = 0
-            else:
-                time.sleep(DELAY_BETWEEN_REQUESTS)
-        print(f"\n=== FINDINGS THIS CYCLE: {len(findings)} ===\n")
-        for f in findings:
-            print(f"@{f['username']}")
-            print(f"  joined: {f['joined']} ({f['account_age_days']}d ago)")
-            print(f"  reasons: {', '.join(f['reasons'])}")
-            print(f"  comment: {f['comment_url']}")
-            print()
-        print("=== ACCOUNT ANALYSIS ===\n")
-        linked_domains = {}
-        for username, profile in account_profiles.items():
-            s = score_account(username)
-            if s['score'] >= 1:
-                print(f"@{username} — {s['score']} suspicious — {', '.join(s['tags']) if s['tags'] else 'none'}")
-                for c in profile['comments']:
-                    for r in c['reasons']:
-                        if r.startswith('domain:'):
-                            dom = r.replace('domain:', '')
-                            linked_domains.setdefault(dom, set()).add(username)
-        print("\n=== CROSS-ACCOUNT ANALYSIS ===\n")
-        for dom, accounts in linked_domains.items():
-            if len(accounts) >= 2:
-                print(f"Domain {dom} — {len(accounts)} accounts: {', '.join('@' + a for a in accounts)}")
-                print("  → Possible coordinated campaign\n")
-        save_findings()
-        print(f"\nCycle complete. Total scanned: {len(state['scanned_article_ids'])}")
-        print(f"Sleeping {SLEEP_WHEN_CAUGHT_UP // 60} min for new articles...\n")
-        time.sleep(SLEEP_WHEN_CAUGHT_UP)
+    seen_articles = set()
+    seen_comments = set()
+    log(f"Resume state: {state.get('scanned_count', 0)} articles scanned previously")
+
+    page = 1
+    while not time_up():
+        log(f"Scanning page {page}...")
+        batch = fetch_json(f"https://dev.to/api/articles?page={page}&per_page=100")
+        if batch is None:
+            log(f"Page {page} fetch failed — stopping")
+            break
+        if len(batch) == 0:
+            log(f"Page {page} empty — end of dev.to. Scan complete.")
+            break
+        SCANNED_PAGES = page
+        log(f"  Got {len(batch)} articles on page {page}")
+        for i, article in enumerate(batch):
+            if time_up():
+                log("Time limit reached — stopping gracefully")
+                save_state(state)
+                write_outputs()
+                return
+            aid = article["id"]
+            if aid in seen_articles:
+                continue
+            seen_articles.add(aid)
+            log(f"  [{i+1}/{len(batch)}] {article['title'][:60]} — @{article.get('user', {}).get('username', '?')}")
+            scan_article(article, seen_comments)
+            SCANNED_ARTICLES += 1
+            state["last_article_id"] = aid
+            state["scanned_count"] = state.get("scanned_count", 0) + 1
+            if SCANNED_ARTICLES % 10 == 0:
+                save_state(state)
+            time.sleep(DELAY_BETWEEN_ARTICLES)
+        page += 1
+        time.sleep(DELAY_BETWEEN_PAGES)
+
+    save_state(state)
+    write_outputs()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
-        print("\n\nCaught Ctrl+C. Saving...\n")
-        save_findings()
-        state = load_state()
-        print(f"Total articles scanned: {len(state.get('scanned_article_ids', []))}")
-        print("\n=== FINAL ACCOUNT ANALYSIS ===\n")
-        for username, profile in account_profiles.items():
-            s = score_account(username)
-            if s['score'] >= 1:
-                print(f"@{username} — {s['score']} suspicious — {', '.join(s['tags']) if s['tags'] else 'no tags'}")
+    except Exception as e:
+        log(f"FATAL: {e}")
+        sys.exit(1)
