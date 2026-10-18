@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Tiger Sentinel v6 — full dev.to scan.
-Scans ALL articles on dev.to (paginated until API returns empty).
-Reads comments only. Logs what it found and what it scanned, page by page.
-Runs in GitHub Actions. Designed for a 6-hour job timeout.
+Scans ALL articles on dev.to. Reads comments only.
+Logs only what it found (not every article it scanned).
 """
 
 import json
@@ -224,7 +223,6 @@ def main():
             log(f"Page {page} empty — end of dev.to. Scan complete.")
             break
         SCANNED_PAGES = page
-        log(f"  Got {len(batch)} articles on page {page}")
         for i, article in enumerate(batch):
             if time_up():
                 log("Time limit reached — stopping gracefully")
@@ -235,7 +233,6 @@ def main():
             if aid in seen_articles:
                 continue
             seen_articles.add(aid)
-            log(f"  [{i+1}/{len(batch)}] {article['title'][:60]} — @{article.get('user', {}).get('username', '?')}")
             scan_article(article, seen_comments)
             SCANNED_ARTICLES += 1
             state["last_article_id"] = aid
