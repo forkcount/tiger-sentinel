@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Tiger Sentinel v7 — web-wide search for labagent.tech.
-Sources: dev.to, Common Crawl, urlscan.io
-Logs the FULL URL for every finding, never truncated.
+Tiger Sentinel v7.1 — web-wide search for labagent.tech.
+Fixed Common Crawl endpoint. Logs the FULL URL for every finding, never truncated.
 """
 
 import json
@@ -24,7 +23,7 @@ DELAY_DEVTO = 3.5
 DELAY_COMMONCRAWL = 2.0
 DELAY_URLSCAN = 10.0
 MAX_RUNTIME_SECONDS = 5 * 60 * 60
-USER_AGENT = "TigerSentinel/7.0 (dev.to community moderation; web-wide scan)"
+USER_AGENT = "TigerSentinel/7.1 (dev.to community moderation; web-wide scan)"
 
 START = time.time()
 
@@ -222,45 +221,63 @@ def scan_devto():
 
 def scan_commoncrawl():
     log("=== Common Crawl scan ===")
+    # Get the latest index name from collinfo
     coll = fetch_json("https://index.commoncrawl.org/collinfo.json")
-    if not coll:
+    if not coll or len(coll) == 0:
         log("Common Crawl: could not fetch index list")
         return
-    index_name = coll[0]["id"]
-    log(f"Common Crawl index: {index_name}")
-    query = quote(f"{TARGET_DOMAIN}/*", safe="")
-    url = f"https://index.commoncrawl.org/{index_name}-index?url={query}&output=json"
-    req = Request(url, headers={"User-Agent": USER_AGENT})
-    count = 0
-    try:
-        with urlopen(req, timeout=60) as r:
-            for line in r:
-                if time_up():
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("status") != "200":
-                    continue
-                full_url = record.get("url", "")
-                if not full_url:
-                    continue
-                log_finding("commoncrawl", full_url, "",
-                            f"status={record.get('status')} mime={record.get('mime', '')}",
-                            record.get("timestamp", ""))
-                count += 1
-                if count >= 1000:
-                    log("Common Crawl: 1000 URL cap reached")
-                    break
-                time.sleep(0.1)
-    except Exception as e:
-        log(f"Common Crawl error: {e}")
-        return
-    log(f"Common Crawl done — {count} URLs found")
+
+    # Try the most recent 3 indexes in case the newest one is unavailable
+    tried = 0
+    for entry in coll[:3]:
+        index_name = entry.get("id", "")
+        if not index_name:
+            continue
+        tried += 1
+        log(f"Trying Common Crawl index: {index_name}")
+
+        query = quote(f"{TARGET_DOMAIN}/*", safe="")
+        url = f"https://index.commoncrawl.org/{index_name}-index?url={query}&output=json"
+
+        req = Request(url, headers={"User-Agent": USER_AGENT})
+        count = 0
+        try:
+            with urlopen(req, timeout=60) as r:
+                for line in r:
+                    if time_up():
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("status") != "200":
+                        continue
+                    full_url = record.get("url", "")
+                    if not full_url:
+                        continue
+                    log_finding("commoncrawl", full_url, "",
+                                f"status={record.get('status')} mime={record.get('mime', '')}",
+                                record.get("timestamp", ""))
+                    count += 1
+                    if count >= 1000:
+                        log("Common Crawl: 1000 URL cap reached")
+                        break
+                    time.sleep(0.1)
+            log(f"Common Crawl ({index_name}) done — {count} URLs found")
+            if count > 0:
+                break  # Found results, no need to try older indexes
+        except HTTPError as e:
+            log(f"Common Crawl ({index_name}) HTTP {e.code} — trying next index")
+            continue
+        except Exception as e:
+            log(f"Common Crawl ({index_name}) error: {e} — trying next index")
+            continue
+
+    if tried == 0:
+        log("Common Crawl: no usable indexes found")
     time.sleep(DELAY_COMMONCRAWL)
 
 
@@ -321,7 +338,7 @@ def write_outputs():
 
 
 def main():
-    log("Tiger Sentinel v7 — web-wide search for labagent.tech")
+    log("Tiger Sentinel v7.1 — web-wide search for labagent.tech")
     scan_devto()
     scan_commoncrawl()
     scan_urlscan()
